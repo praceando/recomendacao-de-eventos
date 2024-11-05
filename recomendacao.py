@@ -1,4 +1,4 @@
-from flask import Flask
+from flask import Flask, jsonify
 from sklearn.neighbors import NearestNeighbors
 from sklearn.feature_extraction.text import CountVectorizer
 import psycopg2
@@ -13,65 +13,72 @@ app = Flask(__name__)
 def connect_db() -> psycopg2.extensions.connection:
     try:
         conn = psycopg2.connect(os.getenv("LINK_2ANO_POSTGRESQL"))
-        if conn:
-            return conn
-        return None
+        return conn
     except Exception as e:
-        print(e)
-        
-def select_query(query:str,user_id:int=0) -> pd.DataFrame:
+        print(f"Error connecting to database: {e}")
+        return None
+
+def select_query(query:str, user_id:int = 0) -> pd.DataFrame:
     conn = connect_db()
-    cursor = conn.cursor()
-    
-    if user_id>0:
-        cursor.execute(query,(user_id,))
-    else:
-        cursor.execute(query)
-    
-    result = cursor.fetchall()
-    columns = [desc[0] for desc in cursor.description]
-    
-    dataframe = pd.DataFrame(result, columns=columns)
-    return dataframe
+    if conn is None:
+        return pd.DataFrame()  # Retorna DataFrame vazio em caso de falha na conexão
+    with conn:
+        with conn.cursor() as cursor:
+            cursor.execute(query, (user_id,))
+            result = cursor.fetchall()
+            columns = [desc[0] for desc in cursor.description]
+            return pd.DataFrame(result, columns=columns)
 
-def search_vector(index:np.ndarray,dataframe:pd.DataFrame) -> list:
-    eventos_id = []
-    for i in index[0]:
-        eventos_id.append(dataframe.loc[i,"id_evento"])
-    return eventos_id
-    
+def search_vector(index: np.ndarray, dataframe: pd.DataFrame) -> list:
+    return dataframe.loc[index[0], "id_evento"].tolist()
+
 @app.route("/recomendation/<int:user_id>/", methods=["GET"])
-def recomendation(user_id:int):
-    
-    df_tag_eventos = select_query("""SELECT e.id_evento, ARRAY_AGG(et.cd_tag) AS array_tag FROM evento e
-                                     JOIN evento_tag et ON et.cd_evento = e.id_evento
-                                     WHERE e.dt_desativacao IS NULL
-                                     GROUP BY e.id_evento
-                                     ORDER BY e.id_evento;""")
+def recomendation(user_id: int):
+    # Consultas combinadas
+    query = """
+        SELECT 
+            e.id_evento, 
+            ARRAY_AGG(et.cd_tag) AS array_tag, 
+            ARRAY_AGG(ut.cd_tag) AS user_tags 
+        FROM 
+            evento e
+        JOIN 
+            evento_tag et ON et.cd_evento = e.id_evento
+        LEFT JOIN 
+            usuario_tag ut ON ut.cd_consumidor = %s
+        WHERE 
+            e.dt_desativacao IS NULL
+        GROUP BY 
+            e.id_evento;
+    """
+    df_eventos = select_query(query, (user_id,))
 
-    df_tag_users = select_query("""SELECT ut.cd_consumidor, ARRAY_AGG(ut.cd_tag) AS array_tag FROM usuario_tag ut
-                                   WHERE ut.cd_consumidor=%s
-                                   GROUP BY ut.cd_consumidor;""",user_id)
-    
-    counts_tag_users = df_tag_users["array_tag"].value_counts().reset_index()
-    tags_eventos = df_tag_eventos['array_tag'].apply(lambda x: ' '.join(map(str, x)))
-        
-    # Criação da matriz de vetores binários de tags usando CountVectorizer
+    if df_eventos.empty:
+        return jsonify({"eventos_ids": []})
+
+    # Processamento das tags
+    df_eventos['array_tag'] = df_eventos['array_tag'].apply(lambda x: ' '.join(map(str, x)))
+    user_tags = df_eventos['user_tags'].values[0] if df_eventos['user_tags'].size > 0 else []
+
+    # Contagem das tags do usuário
+    counts_tag_users = pd.Series(user_tags).value_counts().reset_index(name='count')
+    counts_tag_users.columns = ['tag', 'count']
+
+    # Matriz de características
     vectorizer = CountVectorizer()
-    matrix_counter = vectorizer.fit_transform(tags_eventos).toarray()
+    matrix_counter = vectorizer.fit_transform(df_eventos['array_tag']).toarray()
 
-    # # Convertendo o perfil do usuário para um vetor na mesma dimensão
-    tags_counter = [int(i) for i in vectorizer.get_feature_names_out()]  # Obtenha a lista de todas as tags
-    perfil_vetor =  np.array([counts_tag_users.loc[counts_tag_users['array_tag'] == tag, 'count'].values[0] if tag in counts_tag_users['array_tag'].values else 0 for tag in tags_counter])
+    # Vetor de perfil do usuário
+    perfil_vetor = np.array([counts_tag_users[counts_tag_users['tag'] == tag]['count'].values[0] if tag in counts_tag_users['tag'].values else 0 for tag in vectorizer.get_feature_names_out()])
 
-    # Aplicação do Nearest Neighbors (kNN) para encontrar os eventos mais similares
-    nbrs = NearestNeighbors(n_neighbors=3, metric="euclidean").fit(matrix_counter)
+    # k-NN
+    nbrs = NearestNeighbors(n_neighbors=8, metric="euclidean").fit(matrix_counter)
     _, index = nbrs.kneighbors([perfil_vetor])
-    
-    eventos_ids = search_vector(index, df_tag_eventos)
-    # Garantir que os IDs sejam convertidos em um tipo serializável
-    return {"eventos_ids": [int(evento_id) for evento_id in eventos_ids]}
 
+    eventos_ids = search_vector(index, df_eventos)
+    print(eventos_ids)
+
+    return jsonify({"eventos_ids": [int(evento_id) for evento_id in eventos_ids]})
 
 if __name__ == "__main__":
-    app.run(debug=False,port=5002,host='0.0.0.0')
+    app.run(debug=False, port=5002, host='0.0.0.0')
