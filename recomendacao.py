@@ -78,7 +78,7 @@ def recomendation(user_id: int):
     eventos_ids = search_vector(index, df_eventos)
     print(eventos_ids)
 
-    return jsonify({"eventos_ids": [int(evento_id) for evento_id in eventos_ids]})
+    return jsonify({"eventos_ids": [28] + list(set(int(evento_id) for evento_id in eventos_ids if int(evento_id) != 28))})
 
 if __name__ == "__main__":
     app.run(debug=False, port=5002, host='0.0.0.0')
